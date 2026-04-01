@@ -20,6 +20,11 @@ impl<T: Clone> KVStore<T> {
     pub async fn get(&self, name: String) -> Option<T> { 
         self.inner.read().await.get(&name).cloned()
     }
+
+    #[inline]
+    pub async fn list_keys(&self) -> Vec<String> { 
+        self.inner.read().await.keys().map(|k| k.clone()).collect()
+    }
 }
 
 

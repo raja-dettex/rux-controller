@@ -95,14 +95,37 @@ async fn main() {
     let kv_store = kv_store::KVStore::new();
     let context = Context { store: kv_store.clone(), runtime };
     
-    let (queue, mut rx) = WorkQueue::new(100);
-    let controller = DeploymentController;
-    // worker loop 
-    tokio::spawn(async move { 
-        while let Some(key) = rx.pop().await { 
-            let _ = controller.reconcile(key.clone(), context.clone()).await;
+    let queue  = WorkQueue::new();
+
+    let workers = 4;
+    for _ in 0..workers { 
+    // worker loop
+        let queue_clone = queue.clone();
+        let controller = DeploymentController;
+        let context_clone = context.clone();
+        tokio::spawn(async move { 
+            loop {
+                let key = queue_clone.pop().await;
+                let _ = controller.reconcile(key, context_clone.clone()).await;
+            } 
+        });
+    } 
+
+
+    // periodic resync
+    let another_queue_clone = queue.clone();
+    let kv_clone = kv_store.clone();
+    let _ = tokio::spawn(async move { 
+        loop { 
+            let keys = kv_clone.list_keys().await;
+            for key in keys { 
+                another_queue_clone.push(key.clone()).await;
+            }
+            tokio::time::sleep(Duration::from_secs(4)).await;
         }
     });
+
+    println!("reacjhoing here");
 
 
     // create a resource

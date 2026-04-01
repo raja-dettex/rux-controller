@@ -64,9 +64,10 @@ impl Runtime<Deployment> for ProcessRuntime {
         let mut guard =  self.state.write().await;
         let actual = guard.entry(key.to_string()).or_default();
         let current = actual.len();
-        if desired.replicas as usize > current { 
-            let to_spawn = desired.replicas as usize - current;
-            for _ in 0..to_spawn {
+        let desired_replicas = desired.replicas as usize;
+        if desired_replicas > current { 
+            let to_spawn = desired_replicas - current;
+            for _ in 1..to_spawn {
                 let child = Command::new("sleep")
                     .arg("1000")
                     .stdout(Stdio::null())
@@ -75,6 +76,16 @@ impl Runtime<Deployment> for ProcessRuntime {
 
                 actual.push(child);
             }
+        } 
+        else if desired_replicas < current { 
+            let to_kill = current - desired_replicas;
+            println!("killing {to_kill} replicas");
+            for _ in 0..to_kill {
+                if let Some(mut child) = actual.pop() {
+                    child.kill().await.expect("failed to kill child")
+                }
+            }
+            println!("actual length {:?}", actual.len());
         }
     }
 }
@@ -115,15 +126,33 @@ async fn main() {
     let kv_store = kv_store::KVStore::new();
     let context = Context { store: kv_store.clone(), runtime };
     
-    let (queue, mut rx) = WorkQueue::new(100);
-    let controller = ProcessController;
+    let queue  = WorkQueue::new();
 
+    let workers = 4;
+    for _ in 0..workers { 
+    // worker loop
+        let queue_clone = queue.clone();
+        let controller = ProcessController;
+        let context_clone = context.clone();
+        tokio::spawn(async move { 
+            println!("worker loop has been spawned");
+            loop { 
+                let key = queue_clone.pop().await;
+                let _ = controller.reconcile(key, context_clone.clone()).await;
+            }
+        });
+    } 
 
-    // worker loop 
-    tokio::spawn(async move { 
-        while let Some(key) = rx.pop().await { 
-            println!("received");
-            let _ = controller.reconcile(key.clone(), context.clone()).await;
+    // periodic resync
+    let another_queue_clone = queue.clone();
+    let kv_clone = kv_store.clone();
+    let _ = tokio::spawn(async move { 
+        loop { 
+            let keys = kv_clone.list_keys().await;
+            for key in keys { 
+                another_queue_clone.push(key.clone()).await;
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
 
@@ -137,14 +166,14 @@ async fn main() {
 
     let patched_deployment = Deployment { 
         name: "ngnix".to_string(),
-        spec: DeploymentSpec { replicas: 6 },
+        spec: DeploymentSpec { replicas: 1 },
         status: Default::default()
     };
 
     kv_store.put(nginx_dep.clone().key(), nginx_dep.clone()).await;
     queue.push(nginx_dep.key()).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
-    kv_store.put(patched_deployment.clone().key() , patched_deployment.clone()).await;
-    queue.push(patched_deployment.key()).await;
+    //kv_store.put(patched_deployment.clone().key() , patched_deployment.clone()).await;
+    //queue.push(patched_deployment.key()).await;
     tokio::signal::ctrl_c().await;
 }
