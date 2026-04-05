@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.89"
+rand = "0.10.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.50.0", features = ["full"] }
@@ -23,3 +24,8 @@ path = "src/examples/mem_runtime/main.rs"
 [[bin]]
 name = "process-runtime"
 path = "src/examples/process_runtime/main.rs"
+
+
+[[bin]]
+name = "container-runtime"
+path = "src/examples/container_runtime/main.rs"
