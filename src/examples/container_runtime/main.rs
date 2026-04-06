@@ -1,7 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
+    collections::{HashMap, HashSet}, sync::Arc, thread::current, time::Duration
 };
 
 use rand::seq::IteratorRandom;
@@ -66,6 +64,19 @@ pub struct ContainerRuntime {
 }
 
 impl ContainerRuntime {
+
+    pub async fn target_ports(&self, key: &str) -> Vec<i32> { 
+        if let Some(status) = self.state.read().await.get(key) { 
+            return status.replicas.clone().
+            into_iter().map(|replica| replica.nats).clone().filter_map(|nat| {
+                for (k,_) in nat { 
+                    return Some(k);
+                }
+                None
+            }).collect();
+        }
+        vec![]
+    }
     pub async fn get_actual_set(&self, key: &str) -> HashSet<u32> {
         let mut actual = HashSet::new();
 
@@ -140,17 +151,17 @@ impl Runtime<Deployment> for ContainerRuntime {
     }
 
     async fn apply(&self, key: &str, desired: &DeploymentSpec) {
+        let existing_target_ports: Vec<i32> = self.target_ports(key).await;
         let mut guard = self.state.write().await;
         let current_status = guard.entry(key.to_string()).or_default();
-
         let current = current_status.ready_replicas;
         let desired_replicas = desired.replicas;
-        let existing_target_ports: Vec<i32> = Vec::new();
         // SCALE UP
         if current < desired_replicas {
             
             let to_spawn = desired_replicas - current;
             let actual_set = self.get_actual_set(key).await;
+            
             let diff_set: HashSet<u32> = (0..desired_replicas).filter(|&i| !actual_set.contains(&(i as u32))).collect();
 
             for desired_value in diff_set {
@@ -169,6 +180,7 @@ impl Runtime<Deployment> for ContainerRuntime {
                     }
                 }
 
+
                 // env (FIXED)
                 for (k, v) in desired.template.environments.iter() {
                     cmd.arg("-e").arg(format!("{}={}", k, v));
@@ -180,11 +192,12 @@ impl Runtime<Deployment> for ContainerRuntime {
                     pod.volumes.insert(host_volume.clone(), d.to_string());
                     cmd.arg("-v").arg(format!("{}:{}", host_volume, d));
                 }
+
                 cmd.arg("--label").arg(format!("rux.key={}", key));
                 cmd.arg("--label").arg(format!("rux.replica={}", desired_value));
-
+                println!("after applying levelsd");
                 cmd.arg(&desired.template.image_name);
-
+                println!("hrer image name");
                 match cmd.output().await {
                     Ok(out) if out.status.success() => {
                         let id = String::from_utf8_lossy(&out.stdout)
@@ -235,7 +248,7 @@ impl ContainerController {
         };
 
         let actual = ctx.runtime.observe(&key).await.unwrap();
-
+        println!("current deloyment state {:#?}", actual);
         if actual.ready_replicas != desired.spec.replicas {
             println!(
                 "[RECONCILE] {} actual={} desired={}",
