@@ -8,9 +8,6 @@ use tokio::{process::Command, sync::RwLock};
 
 use async_trait::async_trait;
 
-//
-// ================= RESOURCE =================
-//
 
 #[derive(Clone, Debug)]
 pub struct DeploymentSpec {
@@ -156,15 +153,15 @@ impl Runtime<Deployment> for ContainerRuntime {
         let current_status = guard.entry(key.to_string()).or_default();
         let current = current_status.ready_replicas;
         let desired_replicas = desired.replicas;
+        let desired_set: HashSet<u32> = (0..desired_replicas).collect();
         // SCALE UP
         if current < desired_replicas {
             
-            let to_spawn = desired_replicas - current;
-            let actual_set = self.get_actual_set(key).await;
             
-            let diff_set: HashSet<u32> = (0..desired_replicas).filter(|&i| !actual_set.contains(&(i as u32))).collect();
+            let actual_set = self.get_actual_set(key).await;
+            let to_spawn = &desired_set - &actual_set;
 
-            for desired_value in diff_set {
+            for desired_value in to_spawn {
                 let mut pod = Pod::default();
                 let desired_name = format!("{}-{}", key, desired_value);
                 pod.name = desired_name.clone();
@@ -195,9 +192,7 @@ impl Runtime<Deployment> for ContainerRuntime {
 
                 cmd.arg("--label").arg(format!("rux.key={}", key));
                 cmd.arg("--label").arg(format!("rux.replica={}", desired_value));
-                println!("after applying levelsd");
                 cmd.arg(&desired.template.image_name);
-                println!("hrer image name");
                 match cmd.output().await {
                     Ok(out) if out.status.success() => {
                         let id = String::from_utf8_lossy(&out.stdout)
@@ -216,10 +211,13 @@ impl Runtime<Deployment> for ContainerRuntime {
 
         // SCALE DOWN
         else if current > desired_replicas {
-            let to_kill = current - desired_replicas;
+            let actual_set = self.get_actual_set(key).await;
+            let to_kill = &actual_set - &desired_set;
 
-            for _ in 0..to_kill {
-                if let Some(id) = current_status.replicas.iter().map(|pod| pod.id.clone()).next() {
+
+            for i in to_kill {
+                let name = format!("{}-{}",key, i);
+                if let Some(id) = current_status.clone().replicas.iter().filter(|&pod| pod.name.eq(&name)).map(|pod| pod.id.clone()).next() {
                     let _ = Command::new("docker")
                         .arg("rm")
                         .arg("-f")
@@ -234,9 +232,6 @@ impl Runtime<Deployment> for ContainerRuntime {
     }
 }
 
-//
-// ================= CONTROLLER =================
-//
 
 pub struct ContainerController;
 
@@ -248,7 +243,6 @@ impl ContainerController {
         };
 
         let actual = ctx.runtime.observe(&key).await.unwrap();
-        println!("current deloyment state {:#?}", actual);
         if actual.ready_replicas != desired.spec.replicas {
             println!(
                 "[RECONCILE] {} actual={} desired={}",
