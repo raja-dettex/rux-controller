@@ -1,9 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet}, sync::Arc, thread::current, time::Duration
+    collections::{HashMap, HashSet, hash_map::Entry}, io::ErrorKind, str::FromStr, sync::Arc, thread::current, time::Duration
 };
 
+use bollard::{Docker, plugin::{ContainerCreateBody, ContainerInspectResponse, HostConfig, NetworkCreateRequest, PortBinding}, query_parameters::{CreateContainerOptions, CreateContainerOptionsBuilder, ListContainersOptions, ListContainersOptionsBuilder, StartContainerOptions}};
 use rand::seq::IteratorRandom;
 use rux_controller::{controller::{Context, Runtime}, kv_store::KVStore, resource::Resource, schedular::WorkQueue};
+use serde::de;
 use tokio::{process::Command, sync::RwLock};
 
 use async_trait::async_trait;
@@ -55,12 +57,134 @@ impl Resource for Deployment {
     type Status = DeploymentStatus;
 }
 
+#[derive(PartialEq, Eq, Clone)]
+pub enum NetworkInterface { 
+    Bridge,
+    Host
+}
+
+impl FromStr for NetworkInterface {
+    type Err = std::io::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s { 
+            "bridge" => Ok(Self::Bridge),
+            "host" => Ok(Self::Host),
+            _ => Err(std::io::Error::new(ErrorKind::Other, "unknown type, can not parse it out"))
+        }
+    }
+}
+
+impl Into<String> for NetworkInterface { 
+    fn into(self) -> String {
+        match self { 
+            Self::Bridge => "bridge".to_string(),
+            Self::Host => "host".to_string()
+        }
+    }    
+}
+pub struct NetworkConfig { 
+    namespace_name: String,
+    interface_type: NetworkInterface        
+}
+
+#[derive(Clone)]
+pub struct Builder { 
+    daemon: Docker,
+    networks: Vec<(String, NetworkInterface)>,
+}
+
+use bollard::models::ContainerSummary;
+
+impl Builder { 
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let docker = Docker::connect_with_defaults()?;
+        Ok(Self {
+            daemon: docker,
+            networks: Vec::new()
+        })
+    }
+
+    pub async fn init_builder_context(
+        &self,
+        network_config: NetworkConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.networks.contains(&(
+            network_config.namespace_name.clone(),
+            network_config.interface_type.clone(),
+        )) {
+            return Ok(());
+        }
+        let net_name = network_config.namespace_name.clone();
+        let driver: String = network_config.interface_type.into();
+        let net_config = NetworkCreateRequest {
+            name: net_name,
+            driver: Some(driver),
+            ..Default::default()
+        };
+        let _ = self.create_network(net_config).await;
+        Ok(())
+    }
+
+    pub async fn create_network(&self, net_conf: NetworkCreateRequest) {
+        let _ = self.daemon.create_network(net_conf).await;
+    }
+
+    pub async fn creat_and_start_container(
+        &self,
+        name: String,
+        create_container_options: Option<CreateContainerOptions>,
+        container_conf: ContainerCreateBody,
+        start_container_options: Option<StartContainerOptions>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.daemon
+            .create_container(create_container_options, container_conf)
+            .await?;
+        self.daemon
+            .start_container(&name, start_container_options)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_containers(&self, filters: HashMap<String, Vec<String>>) -> Option<Vec<String>>{ 
+        let list_options = ListContainersOptionsBuilder::default().all(true).filters(&filters).build();  
+        let ids = if let Ok(res) = self.daemon.list_containers(Some(list_options)).await { 
+            Some(res.into_iter().filter_map(|c| c.id).collect())
+        } else { 
+            None
+        };
+        ids
+    }
+
+    pub async fn inspect_containers(&self, container_ids: Vec<String>) -> Vec<ContainerInspectResponse> { 
+        // Assuming `container_ids` is the Vec<String> from the previous step
+        let mut results = Vec::new();
+
+        for id in container_ids {
+            if let Ok(inspect_result) = self.daemon.inspect_container(&id, None).await {
+                // Access .config then .labels (both are Option types in Bollard)
+                results.push(inspect_result);                
+                
+            }
+        }
+        results
+    }
+} 
+
 #[derive(Clone)]
 pub struct ContainerRuntime {
     pub state: Arc<RwLock<HashMap<String, DeploymentStatus>>>, // key -> container IDs
+    builder: Builder
 }
 
 impl ContainerRuntime {
+
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> { 
+        Ok(Self { 
+            state: Arc::new(RwLock::new(HashMap::new())),
+            builder: Builder::new()?         
+        })
+    }
 
     pub async fn target_ports(&self, key: &str) -> Vec<i32> { 
         if let Some(status) = self.state.read().await.get(key) { 
@@ -75,7 +199,26 @@ impl ContainerRuntime {
         vec![]
     }
     pub async fn get_actual_set(&self, key: &str) -> HashSet<u32> {
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec![format!("rux.key={}", key)]);
         let mut actual = HashSet::new();
+        if let Some(ids) = self.builder.list_containers(filters).await { 
+            let inspect_results = self.builder.inspect_containers(ids).await;
+            for result in inspect_results { 
+                if let Some(labels) = result.config.and_then(|c| c.labels) {
+                    // Look for your specific label key
+                    if let Some(replica_str) = labels.get("rux.replica") {
+                        if let Ok(idx) = replica_str.trim().parse::<u32>() {
+                            actual.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+        actual
+        /* let mut actual = HashSet::new();
+        
+        
 
         let out = Command::new("docker")
             .arg("ps")
@@ -111,7 +254,7 @@ impl ContainerRuntime {
             }
         }
 
-        actual
+        actual*/
     }
 }
 
@@ -124,8 +267,25 @@ impl Runtime<Deployment> for ContainerRuntime {
         let status = guard.entry(key.to_string()).or_default();
 
         let mut alive = vec![];
-
-        for replica in status.replicas.iter() {
+        let container_ids = status.replicas.clone().into_iter().map(|r| r.id).collect();
+        let container_ids_to_replica : HashMap<String, Pod> =  status.replicas.clone().into_iter()
+            .map(|p| (p.id.clone(), p)).collect();
+        let inspect_results = self.builder.inspect_containers(container_ids).await;
+        
+        for result in inspect_results { 
+            if let Some(id) = result.id { 
+                let running = result.state.and_then(|s| s.running).unwrap_or(false);
+                if running { 
+                    if let Some(replica) = container_ids_to_replica.get(&id) { 
+                        alive.push(replica.clone());
+                    }
+                }
+            }
+        }
+        let current_status = DeploymentStatus { ready_replicas: alive.len() as u32, replicas: alive};
+        *status = current_status.clone();
+        Some(current_status) 
+        /* for replica in status.replicas.iter() {
             let out = Command::new("docker")
                 .arg("inspect")
                 .arg("-f")
@@ -144,7 +304,7 @@ impl Runtime<Deployment> for ContainerRuntime {
 
         let current_status = DeploymentStatus { ready_replicas: alive.len() as u32, replicas: alive };
         *status = current_status.clone();
-        Some(current_status)
+        Some(current_status) */
     }
 
     async fn apply(&self, key: &str, desired: &DeploymentSpec) {
@@ -165,6 +325,8 @@ impl Runtime<Deployment> for ContainerRuntime {
                 let mut pod = Pod::default();
                 let desired_name = format!("{}-{}", key, desired_value);
                 pod.name = desired_name.clone();
+                 
+                
                 let mut cmd = Command::new("docker");
                 cmd.arg("run").arg("-d").arg("--name").arg(&desired_name);
                 let nats = desired.template.nats.clone();
@@ -176,8 +338,14 @@ impl Runtime<Deployment> for ContainerRuntime {
                         pod.nats.insert(target_port, container_port);    
                     }
                 }
-
-
+                let port_bindings = pod.nats.clone().into_iter().map(|(k, v)| { 
+                    let key = format!("{}/tcp", k);
+                    let val = Some(vec![PortBinding{
+                        host_ip: Some("0.0.0.0".to_string()),
+                        host_port: Some(format!("{v}"))
+                    }]);
+                    (key, val)
+                }).collect();
                 // env (FIXED)
                 for (k, v) in desired.template.environments.iter() {
                     cmd.arg("-e").arg(format!("{}={}", k, v));
@@ -189,7 +357,29 @@ impl Runtime<Deployment> for ContainerRuntime {
                     pod.volumes.insert(host_volume.clone(), d.to_string());
                     cmd.arg("-v").arg(format!("{}:{}", host_volume, d));
                 }
-
+                let binds = pod.volumes.clone().into_iter().map(|(h, c)| format!("{}:{}", h.clone(), c.clone())).collect();
+                let mut labels = HashMap::new();
+                labels.insert("rux.key".to_string(), key.to_string());
+                labels.insert("rux.replica".to_string(), format!("{}", desired_value));
+                let container_config = ContainerCreateBody { 
+                    image: Some(desired.template.image_name.clone()),
+                    labels: Some(labels),
+                    host_config: Some(HostConfig {
+                        port_bindings: Some(port_bindings),
+                        binds: Some(binds),
+                        network_mode: Some("bridge".to_string()),
+                        privileged: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let create_container_options = CreateContainerOptionsBuilder::default().name(&desired_name).build();
+                let _ = self.builder.creat_and_start_container(
+                    desired_name.clone(), 
+                    Some(create_container_options), 
+                    container_config, 
+                    None
+                ).await;
                 cmd.arg("--label").arg(format!("rux.key={}", key));
                 cmd.arg("--label").arg(format!("rux.replica={}", desired_value));
                 cmd.arg(&desired.template.image_name);
@@ -256,12 +446,10 @@ impl ContainerController {
 
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>>{
     let store = KVStore::new();
 
-    let runtime = Arc::new(ContainerRuntime {
-        state: Arc::new(RwLock::new(HashMap::new())),
-    });
+    let runtime = Arc::new(ContainerRuntime::new()?);
 
     let ctx = Context {
         store: store.clone(),
@@ -320,4 +508,5 @@ async fn main() {
     queue.push(dep.key()).await;
 
     tokio::signal::ctrl_c().await.unwrap();
+    Ok(())
 }
