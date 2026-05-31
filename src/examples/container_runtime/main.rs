@@ -136,14 +136,14 @@ impl Builder {
         create_container_options: Option<CreateContainerOptions>,
         container_conf: ContainerCreateBody,
         start_container_options: Option<StartContainerOptions>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.daemon
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let container_create_response = self.daemon
             .create_container(create_container_options, container_conf)
             .await?;
         self.daemon
             .start_container(&name, start_container_options)
             .await?;
-        Ok(())
+        Ok(container_create_response.id)
     }
 
     pub async fn list_containers(&self, filters: HashMap<String, Vec<String>>) -> Option<Vec<String>>{ 
@@ -338,12 +338,13 @@ impl Runtime<Deployment> for ContainerRuntime {
                         pod.nats.insert(target_port, container_port);    
                     }
                 }
-                let port_bindings = pod.nats.clone().into_iter().map(|(k, v)| { 
-                    let key = format!("{}/tcp", k);
+                let port_bindings = pod.nats.clone().into_iter().map(|(target_port, container_port)| { 
+                    let key = format!("{}/tcp", container_port);
                     let val = Some(vec![PortBinding{
                         host_ip: Some("0.0.0.0".to_string()),
-                        host_port: Some(format!("{v}"))
+                        host_port: Some(format!("{target_port}"))
                     }]);
+                    //println!("{:?}, {:?}", key, val);
                     (key, val)
                 }).collect();
                 // env (FIXED)
@@ -374,28 +375,35 @@ impl Runtime<Deployment> for ContainerRuntime {
                     ..Default::default()
                 };
                 let create_container_options = CreateContainerOptionsBuilder::default().name(&desired_name).build();
-                let _ = self.builder.creat_and_start_container(
+                match self.builder.creat_and_start_container(
                     desired_name.clone(), 
                     Some(create_container_options), 
                     container_config, 
                     None
-                ).await;
-                cmd.arg("--label").arg(format!("rux.key={}", key));
-                cmd.arg("--label").arg(format!("rux.replica={}", desired_value));
-                cmd.arg(&desired.template.image_name);
-                match cmd.output().await {
-                    Ok(out) if out.status.success() => {
-                        let id = String::from_utf8_lossy(&out.stdout)
-                            .trim()
-                            .to_string();
-
-                        println!("[SPAWNED] {}", id);
+                ).await {
+                    Ok(id) => { 
+                        println!("[SPAWNED] successfully");
                         pod.id = id;
                         current_status.replicas.push(pod);
-                    }
-                    Err(e) => println!("spawn error: {:?}", e),
-                    Ok(out) => println!("docker run failed {:?}", out),
+                    },
+                    Err(err) => eprintln!("spawn error {:?}", err.to_string()),
                 }
+                // cmd.arg("--label").arg(format!("rux.key={}", key));
+                // cmd.arg("--label").arg(format!("rux.replica={}", desired_value));
+                // cmd.arg(&desired.template.image_name);
+                // match cmd.output().await {
+                //     Ok(out) if out.status.success() => {
+                //         let id = String::from_utf8_lossy(&out.stdout)
+                //             .trim()
+                //             .to_string();
+
+                //         println!("[SPAWNED] {}", id);
+                //         pod.id = id;
+                //         current_status.replicas.push(pod);
+                //     }
+                //     Err(e) => println!("spawn error: {:?}", e),
+                //     Ok(out) => println!("docker run failed {:?}", out),
+                // }
             }
         }
 
