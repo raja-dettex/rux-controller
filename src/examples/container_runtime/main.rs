@@ -1,12 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry}, io::ErrorKind, str::FromStr, sync::Arc, thread::current, time::Duration
+    collections::{HashMap, HashSet}, io::ErrorKind, str::FromStr, sync::Arc, time::Duration
 };
 
-use bollard::{Docker, plugin::{ContainerCreateBody, ContainerInspectResponse, HostConfig, NetworkCreateRequest, PortBinding}, query_parameters::{CreateContainerOptions, CreateContainerOptionsBuilder, ListContainersOptions, ListContainersOptionsBuilder, StartContainerOptions}};
+use bollard::{Docker, plugin::{ContainerCreateBody, ContainerInspectResponse, HostConfig, NetworkCreateRequest, PortBinding}, query_parameters::{CreateContainerOptions, CreateContainerOptionsBuilder , ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder}};
 use rand::seq::IteratorRandom;
 use rux_controller::{controller::{Context, Runtime}, kv_store::KVStore, resource::Resource, schedular::WorkQueue};
-use serde::de;
-use tokio::{process::Command, sync::RwLock};
+use tokio::sync::RwLock;
 
 use async_trait::async_trait;
 
@@ -94,7 +93,6 @@ pub struct Builder {
     networks: Vec<(String, NetworkInterface)>,
 }
 
-use bollard::models::ContainerSummary;
 
 impl Builder { 
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -130,20 +128,36 @@ impl Builder {
         let _ = self.daemon.create_network(net_conf).await;
     }
 
+
+    pub async fn stop_and_remove_container(&self, name: &str, secs_to_wait: i32, force: bool) -> Result<(), Box<dyn std::error::Error>>
+    { 
+        let options = StopContainerOptionsBuilder::default()
+        .t(secs_to_wait)
+        .build();
+
+        self.daemon.stop_container(name, Some(options)).await?;
+        let remove_options = RemoveContainerOptionsBuilder::default()
+            .force(force)
+            .build();
+
+        self.daemon.remove_container(name, Some(remove_options)).await?;
+        Ok(())
+    }
+
     pub async fn creat_and_start_container(
         &self,
         name: String,
         create_container_options: Option<CreateContainerOptions>,
         container_conf: ContainerCreateBody,
         start_container_options: Option<StartContainerOptions>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.daemon
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let container_create_response = self.daemon
             .create_container(create_container_options, container_conf)
             .await?;
         self.daemon
             .start_container(&name, start_container_options)
             .await?;
-        Ok(())
+        Ok(container_create_response.id)
     }
 
     pub async fn list_containers(&self, filters: HashMap<String, Vec<String>>) -> Option<Vec<String>>{ 
@@ -216,45 +230,7 @@ impl ContainerRuntime {
             }
         }
         actual
-        /* let mut actual = HashSet::new();
         
-        
-
-        let out = Command::new("docker")
-            .arg("ps")
-            .arg("--filter")
-            .arg(format!("label=rux.key={}", key))
-            .arg("--format")
-            .arg("{{.ID}}")
-            .output()
-            .await;
-
-        let output = match out {
-            Ok(out) => out,
-            Err(_) => return actual,
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        for id in stdout.lines() {
-            let inspect = Command::new("docker")
-                .arg("inspect")
-                .arg("-f")
-                .arg("{{ index .Config.Labels \"rux.replica\" }}")
-                .arg(id)
-                .output()
-                .await;
-
-            if let Ok(inspect_out) = inspect {
-                let val = String::from_utf8_lossy(&inspect_out.stdout);
-
-                if let Ok(idx) = val.trim().parse::<u32>() {
-                    actual.insert(idx);
-                }
-            }
-        }
-
-        actual*/
     }
 }
 
@@ -285,26 +261,7 @@ impl Runtime<Deployment> for ContainerRuntime {
         let current_status = DeploymentStatus { ready_replicas: alive.len() as u32, replicas: alive};
         *status = current_status.clone();
         Some(current_status) 
-        /* for replica in status.replicas.iter() {
-            let out = Command::new("docker")
-                .arg("inspect")
-                .arg("-f")
-                .arg("{{.State.Running}}")
-                .arg(replica.id.clone())
-                .output()
-                .await;
-
-            if let Ok(out) = out {
-                let s = String::from_utf8_lossy(&out.stdout);
-                if s.trim() == "true" {
-                    alive.push(replica.clone());
-                }
-            }
-        }
-
-        let current_status = DeploymentStatus { ready_replicas: alive.len() as u32, replicas: alive };
-        *status = current_status.clone();
-        Some(current_status) */
+        
     }
 
     async fn apply(&self, key: &str, desired: &DeploymentSpec) {
@@ -327,35 +284,29 @@ impl Runtime<Deployment> for ContainerRuntime {
                 pod.name = desired_name.clone();
                  
                 
-                let mut cmd = Command::new("docker");
-                cmd.arg("run").arg("-d").arg("--name").arg(&desired_name);
                 let nats = desired.template.nats.clone();
                 for container_port in nats {
                     let mut rng = rand::rng();
                     if let Some(target_port) = (0..25000).
                     filter(|i| !existing_target_ports.contains(i)).choose(&mut rng) {
-                        cmd.arg("-p").arg(format!("{}:{}", target_port, container_port));
                         pod.nats.insert(target_port, container_port);    
                     }
                 }
-                let port_bindings = pod.nats.clone().into_iter().map(|(k, v)| { 
-                    let key = format!("{}/tcp", k);
+                let port_bindings = pod.nats.clone().into_iter().map(|(target_port, container_port)| { 
+                    let key = format!("{}/tcp", container_port);
                     let val = Some(vec![PortBinding{
                         host_ip: Some("0.0.0.0".to_string()),
-                        host_port: Some(format!("{v}"))
+                        host_port: Some(format!("{target_port}"))
                     }]);
+                    //println!("{:?}, {:?}", key, val);
                     (key, val)
                 }).collect();
                 // env (FIXED)
-                for (k, v) in desired.template.environments.iter() {
-                    cmd.arg("-e").arg(format!("{}={}", k, v));
-                }
 
                 // volumes
                 for (h, d) in desired.template.volumes.iter() {
                     let host_volume = format!("{}/{}", h, desired_name);
                     pod.volumes.insert(host_volume.clone(), d.to_string());
-                    cmd.arg("-v").arg(format!("{}:{}", host_volume, d));
                 }
                 let binds = pod.volumes.clone().into_iter().map(|(h, c)| format!("{}:{}", h.clone(), c.clone())).collect();
                 let mut labels = HashMap::new();
@@ -374,27 +325,18 @@ impl Runtime<Deployment> for ContainerRuntime {
                     ..Default::default()
                 };
                 let create_container_options = CreateContainerOptionsBuilder::default().name(&desired_name).build();
-                let _ = self.builder.creat_and_start_container(
+                match self.builder.creat_and_start_container(
                     desired_name.clone(), 
                     Some(create_container_options), 
                     container_config, 
                     None
-                ).await;
-                cmd.arg("--label").arg(format!("rux.key={}", key));
-                cmd.arg("--label").arg(format!("rux.replica={}", desired_value));
-                cmd.arg(&desired.template.image_name);
-                match cmd.output().await {
-                    Ok(out) if out.status.success() => {
-                        let id = String::from_utf8_lossy(&out.stdout)
-                            .trim()
-                            .to_string();
-
-                        println!("[SPAWNED] {}", id);
+                ).await {
+                    Ok(id) => { 
+                        println!("[SPAWNED] successfully");
                         pod.id = id;
                         current_status.replicas.push(pod);
-                    }
-                    Err(e) => println!("spawn error: {:?}", e),
-                    Ok(out) => println!("docker run failed {:?}", out),
+                    },
+                    Err(err) => eprintln!("spawn error {:?}", err.to_string()),
                 }
             }
         }
@@ -408,14 +350,10 @@ impl Runtime<Deployment> for ContainerRuntime {
             for i in to_kill {
                 let name = format!("{}-{}",key, i);
                 if let Some(id) = current_status.clone().replicas.iter().filter(|&pod| pod.name.eq(&name)).map(|pod| pod.id.clone()).next() {
-                    let _ = Command::new("docker")
-                        .arg("rm")
-                        .arg("-f")
-                        .arg(&id)
-                        .output()
-                        .await;
-
-                    println!("[KILLED] {}", id);
+                    match self.builder.stop_and_remove_container(&id, 1, true).await { 
+                        Ok(_) => println!("[Killed] id"),
+                        Err(err) => println!("[ERROR] killing container with id {}, error: {}", id, err.to_string())
+                    }
                 }
             }
         }
